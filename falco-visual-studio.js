@@ -16,6 +16,18 @@
  */
 
 (function () {
+    // 🛡️ AMBIENTE: O Studio Visual roda EXCLUSIVAMENTE em ambiente de desenvolvimento (localhost / 127.0.0.1) ou com ?studio=1.
+    // Em produção (falcotech.com.br, etc.), ele é 100% inativo e não renderiza nenhum elemento na tela.
+    const isLocalEnv = window.location.hostname === 'localhost' || 
+                       window.location.hostname === '127.0.0.1' || 
+                       window.location.hostname.endsWith('.local') ||
+                       window.location.search.includes('studio=1') ||
+                       window.location.search.includes('edit=1');
+
+    if (!isLocalEnv) {
+        return; // Sai imediatamente em produção para garantir 0 impacto no usuário final
+    }
+
     if (window.FalcoVisualStudioLoaded) return;
     window.FalcoVisualStudioLoaded = true;
 
