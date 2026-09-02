@@ -1299,7 +1299,14 @@
     </div>
 
     <!-- ── MOTOR UNIVERSAL DO STUDIO VISUAL FALCO ── -->
-    <script src="falco-visual-studio.js"></script>
+    <script>
+    // Carrega Studio Visual apenas em ambiente local
+    if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" || window.location.hostname.endsWith(".local") || window.location.search.includes("studio=1")) {
+        const s = document.createElement("script");
+        s.src = "falco-visual-studio.js";
+        document.body.appendChild(s);
+    }
+</script>
 
     <!-- ── Lógica da Seção de Diagnóstico e FAQ da Saúde ── -->
     <script>
