@@ -16,22 +16,142 @@
  */
 
 (function () {
-    // 🛡️ AMBIENTE: O Studio Visual roda EXCLUSIVAMENTE em ambiente de desenvolvimento (localhost / 127.0.0.1) ou com ?studio=1.
-    // Em produção (falcotech.com.br, etc.), ele é 100% inativo e não renderiza nenhum elemento na tela.
-    const isLocalEnv = window.location.hostname === 'localhost' || 
-                       window.location.hostname === '127.0.0.1' || 
-                       window.location.hostname.endsWith('.local') ||
-                       window.location.search.includes('studio=1') ||
-                       window.location.search.includes('edit=1');
+    // 🛡️ AMBIENTE: O Studio Visual roda EXCLUSIVAMENTE em ambiente de desenvolvimento (localhost / 127.0.0.1).
+    // Em producao (*.falcotech.com.br), ele e 100% silencioso e NUNCA renderiza nenhum elemento.
+    const isLocal = window.location.hostname === "localhost" || 
+                    window.location.hostname === "127.0.0.1" || 
+                    window.location.hostname.endsWith(".local") ||
+                    window.location.search.includes("studio=1");
 
-    if (!isLocalEnv) {
-        return; // Sai imediatamente em produção para garantir 0 impacto no usuário final
+    if (!isLocal) {
+        return; // Encerra imediatamente em producao
     }
 
     if (window.FalcoVisualStudioLoaded) return;
     window.FalcoVisualStudioLoaded = true;
 
-    const STORAGE_KEY = 'falco_studio_saved_' + (window.location.pathname || 'root').replace(/[^a-zA-Z0-9]/g, '_');
+
+    
+    function getNormalizedStorageKey() {
+        let pathname = window.location.pathname || '/';
+        pathname = pathname.replace(/\/index\.html?$/i, '/').replace(/\/+$/, '') || '/';
+        if (pathname === '/') return 'falco_studio_saved_root';
+        return 'falco_studio_saved_' + pathname.replace(/[^a-zA-Z0-9]/g, '_');
+    }
+    const STORAGE_KEY = getNormalizedStorageKey();
+    const DB_NAME = 'FalcoStudioDB';
+    const DB_VERSION = 2;
+    const STORE_NAME = 'page_snapshots';
+
+    // ── HISTÓRICO DE DESFAZER (UNDO STACK) ──
+    const undoStack = [];
+    const MAX_UNDO = 50;
+
+    function recordState() {
+        try {
+            const pageElements = Array.from(document.body.children).filter(el => {
+                if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false;
+                if (el.id && el.id.startsWith('falco-')) return false;
+                return true;
+            });
+
+            const snapshot = pageElements.map(el => {
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('#falco-top-studio-bar, #falco-editor-bar, #falco-floating-inspector, #falco-transform-gizmo, #falco-alignment-overlay, #falco-studio-launcher-btn, #falco-studio-styles, #falco-studio-fonts, #falco-studio-toast').forEach(c => c.remove());
+                clone.querySelectorAll('.fvs-selected-element').forEach(c => c.classList.remove('fvs-selected-element'));
+                clone.querySelectorAll('[contenteditable]').forEach(c => c.removeAttribute('contenteditable'));
+                return {
+                    id: el.id || '',
+                    tagName: el.tagName,
+                    outerHTML: clone.outerHTML
+                };
+            });
+
+            undoStack.push(snapshot);
+            if (undoStack.length > MAX_UNDO) undoStack.shift();
+            updateUndoButton();
+        } catch (e) {
+            console.warn('Falha ao registrar estado no histórico:', e);
+        }
+    }
+
+    function updateUndoButton() {
+        const btn = document.getElementById('fvs-btn-undo');
+        if (btn) {
+            btn.disabled = undoStack.length === 0;
+            btn.style.opacity = undoStack.length === 0 ? '0.4' : '1';
+        }
+    }
+
+    // ── MOTOR DE PERSISTÊNCIA INDEXEDDB (Sem limite de 5MB) ──
+    function openDatabase() {
+        return new Promise((resolve, reject) => {
+            if (!window.indexedDB) {
+                resolve(null);
+                return;
+            }
+            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(STORE_NAME)) {
+                    db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => resolve(null);
+        });
+    }
+
+    async function saveToDB(key, data) {
+        try {
+            const db = await openDatabase();
+            if (db) {
+                return new Promise((resolve) => {
+                    const tx = db.transaction(STORE_NAME, 'readwrite');
+                    const store = tx.objectStore(STORE_NAME);
+                    store.put({ key: key, data: data, updatedAt: Date.now() });
+                    tx.oncomplete = () => resolve(true);
+                    tx.onerror = () => resolve(false);
+                });
+            }
+        } catch (e) {
+            console.warn('Erro ao salvar no IndexedDB:', e);
+        }
+        return false;
+    }
+
+    async function loadFromDB(key) {
+        try {
+            const db = await openDatabase();
+            if (db) {
+                return new Promise((resolve) => {
+                    const tx = db.transaction(STORE_NAME, 'readonly');
+                    const store = tx.objectStore(STORE_NAME);
+                    const req = store.get(key);
+                    req.onsuccess = () => {
+                        resolve(req.result ? req.result.data : null);
+                    };
+                    req.onerror = () => resolve(null);
+                });
+            }
+        } catch (e) {
+            console.warn('Erro ao carregar do IndexedDB:', e);
+        }
+        return null;
+    }
+
+    function showToast(msg, icon = '✅') {
+        let toast = document.getElementById('falco-studio-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'falco-studio-toast';
+            document.body.appendChild(toast);
+        }
+        toast.innerHTML = '<span>' + icon + '</span><span>' + msg + '</span>';
+        toast.classList.add('show');
+        setTimeout(() => toast.classList.remove('show'), 3500);
+    }
+
 
     let isEditMode = true;
     let barPosition = 'top'; // 'top' ou 'bottom'
@@ -44,7 +164,7 @@
     let currentHandle = null;
     let startX = 0, startY = 0;
     let startWidth = 0, startHeight = 0;
-    let startMarginLeft = 0, startMarginTop = 0;
+    let startLeft = 0, startTop = 0;
 
     function injectGoogleFonts() {
         const fontId = 'falco-studio-fonts';
@@ -73,6 +193,49 @@
                 --fvs-border: rgba(201, 169, 97, 0.35);
                 --fvs-text-light: #f4f4f5;
                 --fvs-text-muted: #a1a1aa;
+            }
+
+            
+            /* ── DESATIVAÇÃO FORÇADA DE 3D E LEVITAÇÃO ── */
+            .fvs-no-3d,
+            .fvs-no-3d *,
+            .portrait-3d-wrapper.fvs-no-3d,
+            .portrait-frame-card.fvs-no-3d,
+            [data-fvs-disable-3d="true"],
+            [data-fvs-disable-3d="true"] * {
+                animation: none !important;
+                transform: none !important;
+                perspective: none !important;
+                transform-style: flat !important;
+                transition: none !important;
+            }
+
+            /* Toast Notification */
+            #falco-studio-toast {
+                position: fixed;
+                bottom: 24px;
+                right: 24px;
+                background: #0c0c10;
+                border: 1px solid var(--fvs-gold-primary);
+                color: #f4f4f5;
+                padding: 12px 20px;
+                border-radius: 16px;
+                font-family: 'Outfit', sans-serif;
+                font-size: 13px;
+                font-weight: 600;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+                z-index: 2147483647;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                transform: translateY(100px);
+                opacity: 0;
+                transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+                pointer-events: none;
+            }
+            #falco-studio-toast.show {
+                transform: translateY(0);
+                opacity: 1;
             }
 
             /* ── DESLOCAMENTO INTELIGENTE DO CABEÇALHO PARA NUNCA TRUNCAR ── */
@@ -234,6 +397,134 @@
                 cursor: grabbing !important;
             }
 
+            /* ── RÉGUA & LINHAS GUIAS DE ALINHAMENTO INTELIGENTE ── */
+            #falco-alignment-overlay {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100vw;
+                height: 100vh;
+                pointer-events: none;
+                z-index: 2147483625;
+                opacity: 0;
+                visibility: hidden;
+                transition: opacity 0.15s ease, visibility 0.15s ease;
+            }
+
+            #falco-alignment-overlay.active {
+                opacity: 1;
+                visibility: visible;
+            }
+
+            .fvs-guide-line {
+                position: absolute;
+                pointer-events: none;
+            }
+
+            .fvs-guide-v {
+                top: 0;
+                bottom: 0;
+                width: 1px;
+                background: rgba(223, 192, 121, 0.85);
+                box-shadow: 0 0 6px rgba(201, 169, 97, 0.7);
+            }
+
+            .fvs-guide-h {
+                left: 0;
+                right: 0;
+                height: 1px;
+                background: rgba(223, 192, 121, 0.85);
+                box-shadow: 0 0 6px rgba(201, 169, 97, 0.7);
+            }
+
+            .fvs-guide-accent {
+                background: rgba(223, 192, 121, 0.95);
+                border-left: 1px dashed #ffffff;
+                border-top: 1px dashed #ffffff;
+            }
+
+            .fvs-guide-screen-center {
+                top: 0;
+                bottom: 0;
+                width: 2px !important;
+                background: #38bdf8 !important;
+                box-shadow: 0 0 12px rgba(56, 189, 248, 0.95), 0 0 4px #ffffff !important;
+                z-index: 2147483628;
+            }
+
+            .fvs-guide-badge {
+                position: absolute;
+                top: 32px;
+                left: 8px;
+                background: #0284c7;
+                color: #ffffff;
+                font-family: 'Inter', sans-serif;
+                font-size: 10px;
+                font-weight: 700;
+                padding: 3px 8px;
+                border-radius: 4px;
+                white-space: nowrap;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+                letter-spacing: 0.3px;
+            }
+
+            /* Réguas Milimétricas no Topo e na Esquerda */
+            #falco-ruler-top {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100vw;
+                height: 24px;
+                pointer-events: none;
+                z-index: 2147483638;
+            }
+
+            #falco-ruler-left {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 24px;
+                height: 100vh;
+                pointer-events: none;
+                z-index: 2147483638;
+            }
+
+            /* HUD Flutuante de Medidas e Coordenadas */
+            #falco-hud-dimensions {
+                position: fixed;
+                background: rgba(9, 9, 12, 0.96);
+                border: 1px solid var(--fvs-gold-primary);
+                box-shadow: 0 8px 24px rgba(0,0,0,0.85), 0 0 12px rgba(201, 169, 97, 0.35);
+                color: #f4f4f5;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 6px 12px;
+                border-radius: 8px;
+                pointer-events: none;
+                z-index: 2147483640;
+                display: none;
+                align-items: center;
+                gap: 8px;
+                white-space: nowrap;
+                backdrop-filter: blur(10px);
+                transition: opacity 0.1s ease;
+            }
+
+            .fvs-hud-divider {
+                color: rgba(201, 169, 97, 0.5);
+            }
+
+            .fvs-hud-snap-badge {
+                background: rgba(56, 189, 248, 0.2);
+                border: 1px solid #38bdf8;
+                color: #38bdf8;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+
             /* ── BARRA FIXA DO STUDIO (TOPO OU RODAPÉ) ── */
             #falco-top-studio-bar {
                 position: fixed;
@@ -362,7 +653,7 @@
                 position: fixed;
                 top: 64px;
                 right: 18px;
-                width: 320px;
+                width: 350px;
                 max-height: calc(100vh - 80px);
                 z-index: 2147483645;
                 background: var(--fvs-panel-bg);
@@ -410,19 +701,21 @@
                 display: flex;
                 background: rgba(0, 0, 0, 0.4);
                 border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                overflow-x: auto;
             }
 
             .fvs-tab-btn {
                 flex: 1;
-                padding: 8px 4px;
+                padding: 8px 3px;
                 text-align: center;
                 background: transparent;
                 border: none;
                 border-bottom: 2px solid transparent;
                 color: var(--fvs-text-muted);
-                font-size: 11px;
+                font-size: 10.5px;
                 font-weight: 600;
                 cursor: pointer;
+                white-space: nowrap;
                 transition: all 0.2s;
             }
 
@@ -430,6 +723,114 @@
                 color: var(--fvs-gold-light);
                 border-bottom-color: var(--fvs-gold-primary);
                 background: rgba(201, 169, 97, 0.1);
+            }
+
+            /* ANIMAÇÕES & EFEITOS DINÂMICOS */
+            @keyframes fvs-float-3d {
+                0% { transform: translateY(0px) rotateX(1deg) rotateY(-2deg); }
+                100% { transform: translateY(-14px) rotateX(-1deg) rotateY(2deg) scale(1.02); }
+            }
+
+            @keyframes fvs-pulse-heartbeat {
+                0%, 100% { transform: scale(1); }
+                50% { transform: scale(1.04); }
+            }
+
+            @keyframes fvs-shimmer-sweep {
+                0% { background-position: -200% 0; }
+                100% { background-position: 200% 0; }
+            }
+
+            @keyframes fvs-beacon-pulse-green {
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+                70% { transform: scale(1.1); box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+            }
+
+            @keyframes fvs-beacon-pulse-red {
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.8); }
+                70% { transform: scale(1.15); box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+            }
+
+            @keyframes fvs-beacon-pulse-gold {
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(201, 169, 97, 0.8); }
+                70% { transform: scale(1.15); box-shadow: 0 0 0 10px rgba(201, 169, 97, 0); }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(201, 169, 97, 0); }
+            }
+
+            .fvs-fx-float-3d {
+                animation: fvs-float-3d 5.5s ease-in-out infinite alternate !important;
+                perspective: 1000px !important;
+                transform-style: preserve-3d !important;
+            }
+
+            .fvs-fx-pulse {
+                animation: fvs-pulse-heartbeat 2.5s ease-in-out infinite !important;
+            }
+
+            .fvs-fx-shimmer {
+                background-size: 200% auto !important;
+                background-image: linear-gradient(110deg, #c9a961 0%, #ffffff 50%, #c9a961 100%) !important;
+                animation: fvs-shimmer-sweep 3s linear infinite !important;
+                color: #060608 !important;
+            }
+
+            .fvs-fx-glow-gold {
+                box-shadow: 0 0 25px rgba(201, 169, 97, 0.65), 0 10px 30px rgba(0,0,0,0.8) !important;
+            }
+
+            .fvs-fx-glass-gold {
+                background: rgba(14, 14, 20, 0.72) !important;
+                backdrop-filter: blur(18px) !important;
+                -webkit-backdrop-filter: blur(18px) !important;
+                border: 1px solid rgba(201, 169, 97, 0.4) !important;
+                box-shadow: 0 15px 35px rgba(0,0,0,0.7) !important;
+            }
+
+            .fvs-fx-glass-dark {
+                background: rgba(8, 8, 12, 0.85) !important;
+                backdrop-filter: blur(20px) !important;
+                -webkit-backdrop-filter: blur(20px) !important;
+                border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                box-shadow: 0 20px 40px rgba(0,0,0,0.9) !important;
+            }
+
+            .fvs-fx-neon-border {
+                border: 2px solid #dfc079 !important;
+                box-shadow: 0 0 15px rgba(201, 169, 97, 0.5), inset 0 0 15px rgba(201, 169, 97, 0.3) !important;
+            }
+
+            .fvs-fx-uppercase-pro {
+                text-transform: uppercase !important;
+                letter-spacing: 0.14em !important;
+                font-weight: 800 !important;
+            }
+
+            .fvs-status-beacon {
+                display: inline-block !important;
+                width: 10px !important;
+                height: 10px !important;
+                border-radius: 50% !important;
+                margin-right: 8px !important;
+                vertical-align: middle !important;
+                position: relative !important;
+                flex-shrink: 0 !important;
+            }
+
+            .fvs-beacon-green {
+                background-color: #22c55e !important;
+                animation: fvs-beacon-pulse-green 1.8s infinite ease-in-out !important;
+            }
+
+            .fvs-beacon-red {
+                background-color: #ef4444 !important;
+                animation: fvs-beacon-pulse-red 1.5s infinite ease-in-out !important;
+            }
+
+            .fvs-beacon-gold {
+                background-color: #c9a961 !important;
+                animation: fvs-beacon-pulse-gold 2s infinite ease-in-out !important;
             }
 
             .fvs-inspector-body {
@@ -610,12 +1011,15 @@
                 <button type="button" class="fvs-btn" onclick="window.FalcoStudio.moveElement(0, 10)" title="Descer (10px)">⬇ Descer</button>
                 <button type="button" class="fvs-btn" onclick="window.FalcoStudio.moveElement(-10, 0)" title="Mover Esquerda">⬅</button>
                 <button type="button" class="fvs-btn" onclick="window.FalcoStudio.moveElement(10, 0)" title="Mover Direita">➡</button>
-                <button type="button" class="fvs-btn" onclick="window.FalcoStudio.toggleInspector()" id="fvs-btn-toggle-inspector" title="Abrir/Fechar Painel Completo">
+                <button type="button" class="fvs-btn active" onclick="window.FalcoStudio.toggleInspector()" id="fvs-btn-toggle-inspector" title="Abrir/Fechar Painel Completo">
                     <span>🎛️ Painel</span>
                 </button>
             </div>
 
             <div class="fvs-bar-right">
+                <button type="button" class="fvs-btn" id="fvs-btn-undo" onclick="window.FalcoStudio.undo()" title="Desfazer última alteração (Ctrl+Z / Cmd+Z)" style="opacity: 0.4;">
+                    <span>↩️ Desfazer</span>
+                </button>
                 <button type="button" class="fvs-btn fvs-btn-gold-action" onclick="window.FalcoStudio.saveEdits()" title="Salvar no Navegador">
                     <span>💾 Salvar</span>
                 </button>
@@ -631,6 +1035,34 @@
             </div>
         `;
         document.body.appendChild(topBar);
+
+        // ── OVERLAY DE RÉGUAS & LINHAS GUIAS DE ALINHAMENTO ──
+        const overlay = document.createElement('div');
+        overlay.id = 'falco-alignment-overlay';
+        overlay.innerHTML = `
+            <div id="fvs-guide-left" class="fvs-guide-line fvs-guide-v"></div>
+            <div id="fvs-guide-right" class="fvs-guide-line fvs-guide-v"></div>
+            <div id="fvs-guide-center-x" class="fvs-guide-line fvs-guide-v fvs-guide-accent"></div>
+            <div id="fvs-guide-top" class="fvs-guide-line fvs-guide-h"></div>
+            <div id="fvs-guide-bottom" class="fvs-guide-line fvs-guide-h"></div>
+            <div id="fvs-guide-center-y" class="fvs-guide-line fvs-guide-h fvs-guide-accent"></div>
+            <div id="fvs-guide-screen-center" class="fvs-guide-line fvs-guide-v fvs-guide-screen-center" style="display:none;">
+                <span class="fvs-guide-badge">🎯 Centro da Tela</span>
+            </div>
+
+            <!-- Réguas Dinâmicas -->
+            <canvas id="falco-ruler-top" height="24"></canvas>
+            <canvas id="falco-ruler-left" width="24"></canvas>
+
+            <!-- HUD Flutuante de Medidas -->
+            <div id="falco-hud-dimensions">
+                <span id="fvs-hud-coords">X: 0px  Y: 0px</span>
+                <span class="fvs-hud-divider">|</span>
+                <span id="fvs-hud-size">0 × 0px</span>
+                <span id="fvs-hud-snap" class="fvs-hud-snap-badge" style="display:none;">🎯 Centro (50%)</span>
+            </div>
+        `;
+        document.body.appendChild(overlay);
 
         // ── GIZMO DE TRANSFORMAÇÃO FLUTUANTE ──
         const gizmo = document.createElement('div');
@@ -667,13 +1099,14 @@
                     <span>🎛️ INSPETOR VISUAL</span>
                     <span id="fvs-target-type-badge" style="color: #ffffff; opacity: 0.8; font-weight: normal;">(Geral)</span>
                 </div>
-                <button type="button" onclick="window.FalcoStudio.toggleInspector()" style="background:none; border:none; color:#aaa; font-size:16px; cursor:pointer;">✕</button>
+                <button type="button" onclick="window.FalcoStudio.toggleInspector(false)" style="background:none; border:none; color:#aaa; font-size:16px; cursor:pointer;">✕</button>
             </div>
 
             <div class="fvs-inspector-tabs">
                 <button type="button" class="fvs-tab-btn active" onclick="window.FalcoStudio.switchTab('style', this)">🎨 Estilo</button>
                 <button type="button" class="fvs-tab-btn" onclick="window.FalcoStudio.switchTab('typography', this)">🔤 Texto</button>
                 <button type="button" class="fvs-tab-btn" onclick="window.FalcoStudio.switchTab('media', this)">🖼️ Imagem</button>
+                <button type="button" class="fvs-tab-btn" onclick="window.FalcoStudio.switchTab('effects', this)">⚡ Efeitos</button>
                 <button type="button" class="fvs-tab-btn" onclick="window.FalcoStudio.switchTab('spacing', this)">📐 Posição</button>
             </div>
 
@@ -779,9 +1212,21 @@
                         </div>
                     </div>
 
-                    <div class="fvs-field">
-                        <div class="fvs-field-label">Link ou WhatsApp (se for botão/link)</div>
-                        <input type="text" id="fvs-input-link" class="fvs-input" placeholder="https://wa.me/55..." oninput="window.FalcoStudio.setLink(this.value)">
+                    <div class="fvs-field" style="background: rgba(201, 169, 97, 0.08); padding: 10px; border-radius: 8px; border: 1px solid rgba(201, 169, 97, 0.25);">
+                        <div class="fvs-field-label" style="color: var(--fvs-gold-light); font-weight: 700;">🔗 Destino do Botão / Link</div>
+                        <input type="text" id="fvs-input-link" class="fvs-input" placeholder="https://wa.me/55... ou #formulario" oninput="window.FalcoStudio.setLink(this.value)">
+                        
+                        <div style="display: flex; gap: 6px; margin-top: 8px;">
+                            <button type="button" class="fvs-preset-btn" style="flex:1; font-size:10px;" onclick="window.FalcoStudio.setQuickWhatsApp('21964074111', 'Olá, Dr. Roberto! Gostaria de uma avaliação para o meu caso de saúde.')">💬 WhatsApp Oficial</button>
+                            <button type="button" class="fvs-preset-btn" style="flex:1; font-size:10px;" onclick="window.FalcoStudio.setQuickAnchor('#formulario-triagem')">📝 Âncora Formulário</button>
+                        </div>
+
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 8px;">
+                            <label style="font-size: 10.5px; color: var(--fvs-text-muted); display:flex; align-items:center; gap:5px; cursor:pointer;">
+                                <input type="checkbox" id="fvs-input-target-blank" onchange="window.FalcoStudio.setLinkTarget(this.checked)">
+                                <span>Abrir em nova aba (_blank)</span>
+                            </label>
+                        </div>
                     </div>
                 </div>
 
@@ -818,7 +1263,55 @@
                     </div>
                 </div>
 
-                <!-- ABA 4: ESPAÇAMENTO & POSIÇÃO -->
+                <!-- ABA 4: EFEITOS & ANIMAÇÕES PRO -->
+                <div id="fvs-tab-effects" class="fvs-tab-content" style="display:none;">
+                    
+                    <!-- 1. FLUTAÇÃO & 3D -->
+                    <div class="fvs-field">
+                        <div class="fvs-field-label">🌟 Flutuação & Efeitos 3D</div>
+                        <div class="fvs-btn-grid">
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('float-3d')">✨ Levitação 3D</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('disable-3d')" style="color:#f59e0b;">🔲 Tirar Distorção 3D</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('glow-gold')">🌟 Glow Dourado</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('remove-3d')" style="color:#ef4444; font-weight: bold;">🛑 Limpar Todos os Efeitos</button>
+                        </div>
+                    </div>
+
+                    <!-- 2. LUZES DE STATUS (BEACONS PULSANTES) -->
+                    <div class="fvs-field">
+                        <div class="fvs-field-label">🟢 Luzes de Status (Pulsing Lights)</div>
+                        <div class="fvs-btn-grid">
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.addStatusBeacon('green')">🟢 Luz Verde ON</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.addStatusBeacon('red')">🔴 Luz Vermelha</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.addStatusBeacon('gold')">🟡 Luz Dourada</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.addStatusBeacon('remove')" style="color:#aaa;">❌ Tirar Luz</button>
+                        </div>
+                    </div>
+
+                    <!-- 3. EFEITOS PARA BOTÕES & CTAS -->
+                    <div class="fvs-field">
+                        <div class="fvs-field-label">🚀 Animações para Botões & CTAs</div>
+                        <div class="fvs-btn-grid">
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('uppercase-pro')">🔠 Caixa Alta PRO</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('shimmer')">💫 Brilho Shimmer</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('pulse-heartbeat')">💓 Pulso Clique</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('whatsapp-glow')">🟢 WhatsApp Glow</button>
+                        </div>
+                    </div>
+
+                    <!-- 4. GLASSMORPHISM & BORDAS PRO -->
+                    <div class="fvs-field">
+                        <div class="fvs-field-label">💎 Glassmorphism & Superfícies</div>
+                        <div class="fvs-btn-grid">
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('glass-gold')">💎 Ultra Glass Ouro</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('glass-dark')">⬛ Dark Glass Ônix</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('neon-border')">✨ Borda Neon</button>
+                            <button type="button" class="fvs-preset-btn" onclick="window.FalcoStudio.applyEffect('gold-outline')">🛡️ Outline Dourado</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ABA 5: ESPAÇAMENTO & POSIÇÃO -->
                 <div id="fvs-tab-spacing" class="fvs-tab-content" style="display:none;">
                     <div class="fvs-field">
                         <div class="fvs-field-label">Mover Posição (Pixels)</div>
@@ -889,12 +1382,23 @@
                     isDragging = false;
                     currentHandle = null;
                     this.updateGizmoPosition();
+                    this.hideGuides();
                 }
             });
 
             // Recalcular posição do Gizmo ao rolar ou redimensionar
-            window.addEventListener('scroll', () => this.updateGizmoPosition(), { passive: true });
-            window.addEventListener('resize', () => this.updateGizmoPosition(), { passive: true });
+            window.addEventListener('scroll', () => {
+                this.updateGizmoPosition();
+                if (isDragging || isResizing) {
+                    if (activeElement) this.showGuides(activeElement.getBoundingClientRect());
+                }
+            }, { passive: true });
+            window.addEventListener('resize', () => {
+                this.updateGizmoPosition();
+                if (isDragging || isResizing) {
+                    if (activeElement) this.showGuides(activeElement.getBoundingClientRect());
+                }
+            }, { passive: true });
 
             // Alt + Scroll do mouse para escalar qualquer elemento
             window.addEventListener('wheel', (e) => {
@@ -905,27 +1409,199 @@
                 }
             }, { passive: false });
 
-            // Ctrl + E ou Cmd + E
+            // Atalhos de Teclado (Ctrl+E para modo e Setas para mover o elemento selecionado)
             window.addEventListener('keydown', (e) => {
                 if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e') {
                     e.preventDefault();
                     this.toggleMode();
+                    return;
+                }
+
+                // Mover elemento com as setas do teclado (quando não estiver digitando)
+                if (isEditMode && activeElement && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+                    if (document.activeElement.isContentEditable && document.activeElement === activeElement) {
+                        return; // Deixa o cursor de texto normal
+                    }
+
+                    const step = e.shiftKey ? 10 : 2;
+                    if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        this.moveElement(0, -step);
+                    } else if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        this.moveElement(0, step);
+                    } else if (e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        this.moveElement(-step, 0);
+                    } else if (e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        this.moveElement(step, 0);
+                    }
                 }
             });
 
-            this.cleanLegacyStorageArtifacts();
+            // Carregar automaticamente alterações salvas no navegador
+            this.loadSavedEdits();
         },
 
-        // Limpar artefatos e caches de versões antigas gravados no localStorage
-        cleanLegacyStorageArtifacts: function () {
-            try {
-                Object.keys(localStorage).forEach(key => {
-                    if (key.startsWith('falco_studio_saved_') || key.startsWith('falco_editor_')) {
-                        localStorage.removeItem(key);
-                    }
-                });
-            } catch (err) {
-                console.warn('Storage cleanup:', err);
+        // ── MOTOR DE RÉGUAS & LINHAS GUIAS DE ALINHAMENTO ──
+        drawRulers: function (elementRect) {
+            const canvasTop = document.getElementById('falco-ruler-top');
+            const canvasLeft = document.getElementById('falco-ruler-left');
+            if (!canvasTop || !canvasLeft) return;
+
+            const width = window.innerWidth;
+            const height = window.innerHeight;
+
+            if (canvasTop.width !== width) canvasTop.width = width;
+            if (canvasLeft.height !== height) canvasLeft.height = height;
+
+            const ctxTop = canvasTop.getContext('2d');
+            const ctxLeft = canvasLeft.getContext('2d');
+
+            ctxTop.clearRect(0, 0, width, 24);
+            ctxLeft.clearRect(0, 0, 24, height);
+
+            // Fundo das réguas com visual escuro elegante
+            ctxTop.fillStyle = 'rgba(9, 9, 12, 0.94)';
+            ctxTop.fillRect(0, 0, width, 24);
+            ctxLeft.fillStyle = 'rgba(9, 9, 12, 0.94)';
+            ctxLeft.fillRect(0, 0, 24, height);
+
+            // Borda dourada sutil
+            ctxTop.strokeStyle = 'rgba(201, 169, 97, 0.4)';
+            ctxTop.lineWidth = 1;
+            ctxTop.beginPath();
+            ctxTop.moveTo(0, 23.5);
+            ctxTop.lineTo(width, 23.5);
+            ctxTop.stroke();
+
+            ctxLeft.strokeStyle = 'rgba(201, 169, 97, 0.4)';
+            ctxLeft.lineWidth = 1;
+            ctxLeft.beginPath();
+            ctxLeft.moveTo(23.5, 0);
+            ctxLeft.lineTo(23.5, height);
+            ctxLeft.stroke();
+
+            // Marcações em pixels (Top Ruler)
+            ctxTop.font = '9px JetBrains Mono, monospace';
+            ctxTop.fillStyle = '#dfc079';
+            ctxTop.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+
+            for (let x = 0; x < width; x += 10) {
+                const is100 = x % 100 === 0;
+                const is50 = x % 50 === 0;
+                const tickHeight = is100 ? 12 : is50 ? 8 : 4;
+
+                ctxTop.beginPath();
+                ctxTop.moveTo(x + 0.5, 24 - tickHeight);
+                ctxTop.lineTo(x + 0.5, 24);
+                ctxTop.stroke();
+
+                if (is100 && x > 0) {
+                    ctxTop.fillText(x.toString(), x + 3, 11);
+                }
+            }
+
+            // Marcações em pixels (Left Ruler)
+            ctxLeft.font = '9px JetBrains Mono, monospace';
+            ctxLeft.fillStyle = '#dfc079';
+            ctxLeft.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+
+            for (let y = 0; y < height; y += 10) {
+                const is100 = y % 100 === 0;
+                const is50 = y % 50 === 0;
+                const tickWidth = is100 ? 12 : is50 ? 8 : 4;
+
+                ctxLeft.beginPath();
+                ctxLeft.moveTo(24 - tickWidth, y + 0.5);
+                ctxLeft.lineTo(24, y + 0.5);
+                ctxLeft.stroke();
+
+                if (is100 && y > 0) {
+                    ctxLeft.save();
+                    ctxLeft.translate(11, y + 3);
+                    ctxLeft.rotate(-Math.PI / 2);
+                    ctxLeft.fillText(y.toString(), 0, 0);
+                    ctxLeft.restore();
+                }
+            }
+
+            // Destaque da projeção do elemento ativo nas réguas
+            if (elementRect) {
+                // Top Ruler Highlight
+                ctxTop.fillStyle = 'rgba(201, 169, 97, 0.35)';
+                ctxTop.fillRect(elementRect.left, 0, elementRect.width, 24);
+                ctxTop.strokeStyle = '#c9a961';
+                ctxTop.lineWidth = 2;
+                ctxTop.strokeRect(elementRect.left, 0, elementRect.width, 23);
+
+                // Left Ruler Highlight
+                ctxLeft.fillStyle = 'rgba(201, 169, 97, 0.35)';
+                ctxLeft.fillRect(0, elementRect.top, 24, elementRect.height);
+                ctxLeft.strokeStyle = '#c9a961';
+                ctxLeft.lineWidth = 2;
+                ctxLeft.strokeRect(0, elementRect.top, 23, elementRect.height);
+            }
+        },
+
+        showGuides: function (rect) {
+            const overlay = document.getElementById('falco-alignment-overlay');
+            if (!overlay || !rect) return;
+
+            overlay.classList.add('active');
+
+            const screenCenterX = window.innerWidth / 2;
+            const elementCenterX = rect.left + rect.width / 2;
+            const isNearScreenCenter = Math.abs(elementCenterX - screenCenterX) <= 8;
+
+            const gLeft = document.getElementById('fvs-guide-left');
+            const gRight = document.getElementById('fvs-guide-right');
+            const gCenterX = document.getElementById('fvs-guide-center-x');
+            const gTop = document.getElementById('fvs-guide-top');
+            const gBottom = document.getElementById('fvs-guide-bottom');
+            const gCenterY = document.getElementById('fvs-guide-center-y');
+            const gScreenCenter = document.getElementById('fvs-guide-screen-center');
+            const hud = document.getElementById('falco-hud-dimensions');
+            const hudCoords = document.getElementById('fvs-hud-coords');
+            const hudSize = document.getElementById('fvs-hud-size');
+            const hudSnap = document.getElementById('fvs-hud-snap');
+
+            if (gLeft) gLeft.style.left = `${Math.round(rect.left)}px`;
+            if (gRight) gRight.style.left = `${Math.round(rect.right)}px`;
+            if (gCenterX) gCenterX.style.left = `${Math.round(elementCenterX)}px`;
+
+            if (gTop) gTop.style.top = `${Math.round(rect.top)}px`;
+            if (gBottom) gBottom.style.top = `${Math.round(rect.bottom)}px`;
+            if (gCenterY) gCenterY.style.top = `${Math.round(rect.top + rect.height / 2)}px`;
+
+            if (gScreenCenter) {
+                gScreenCenter.style.left = `${Math.round(screenCenterX)}px`;
+                gScreenCenter.style.display = isNearScreenCenter ? 'block' : 'none';
+            }
+
+            if (hud && hudCoords && hudSize) {
+                hud.style.display = 'flex';
+                hudCoords.innerText = `X: ${Math.round(rect.left)}px  Y: ${Math.round(rect.top)}px`;
+                hudSize.innerText = `${Math.round(rect.width)} × ${Math.round(rect.height)}px`;
+
+                if (hudSnap) {
+                    hudSnap.style.display = isNearScreenCenter ? 'inline-block' : 'none';
+                }
+
+                const hudTop = rect.top > 70 ? (rect.top - 42) : (rect.bottom + 12);
+                const hudLeft = Math.max(30, Math.min(window.innerWidth - 250, rect.left));
+                hud.style.top = `${hudTop}px`;
+                hud.style.left = `${hudLeft}px`;
+            }
+
+            this.drawRulers(rect);
+        },
+
+        hideGuides: function () {
+            const overlay = document.getElementById('falco-alignment-overlay');
+            if (overlay) {
+                overlay.classList.remove('active');
             }
         },
 
@@ -954,6 +1630,7 @@
 
             this.syncInspectorValues(el);
             this.updateGizmoPosition();
+            this.toggleInspector(true);
 
             if (el.tagName === 'IMG') {
                 this.switchTab('media', document.querySelectorAll('.fvs-tab-btn')[2]);
@@ -1021,6 +1698,7 @@
             const rect = activeElement.getBoundingClientRect();
             startWidth = rect.width;
             startHeight = rect.height;
+            this.showGuides(rect);
         },
 
         handleResizeMove: function (e) {
@@ -1052,11 +1730,13 @@
             activeElement.style.height = isImage ? 'auto' : `${Math.round(newHeight)}px`;
             activeElement.style.maxWidth = 'none';
 
+            const updatedRect = activeElement.getBoundingClientRect();
             this.updateGizmoPosition();
             this.syncInspectorValues(activeElement);
+            this.showGuides(updatedRect);
         },
 
-        // ── ARRASTAR E MOVER (DRAG TO MOVE) ──
+        // ── ARRASTAR E MOVER UNIVERSAL COM SNAP MAGNÉTICO & RÉGUAS ──
         startMoveDrag: function (e) {
             e.preventDefault();
             e.stopPropagation();
@@ -1067,8 +1747,13 @@
             startY = e.clientY;
 
             const computed = window.getComputedStyle(activeElement);
-            startMarginLeft = parseInt(computed.marginLeft) || 0;
-            startMarginTop = parseInt(computed.marginTop) || 0;
+            if (computed.position === 'static') {
+                activeElement.style.position = 'relative';
+            }
+
+            startLeft = parseFloat(activeElement.style.left) || 0;
+            startTop = parseFloat(activeElement.style.top) || 0;
+            this.showGuides(activeElement.getBoundingClientRect());
         },
 
         handleMoveDragMove: function (e) {
@@ -1077,22 +1762,47 @@
             const dx = e.clientX - startX;
             const dy = e.clientY - startY;
 
-            activeElement.style.marginLeft = `${startMarginLeft + dx}px`;
-            activeElement.style.marginTop = `${startMarginTop + dy}px`;
+            let targetLeft = Math.round(startLeft + dx);
+            let targetTop = Math.round(startTop + dy);
 
+            activeElement.style.left = `${targetLeft}px`;
+            activeElement.style.top = `${targetTop}px`;
+
+            const rect = activeElement.getBoundingClientRect();
+            const screenCenterX = window.innerWidth / 2;
+            const elementCenterX = rect.left + rect.width / 2;
+
+            // Snap magnético suave ao centro da tela (tolerância de 8px)
+            if (Math.abs(elementCenterX - screenCenterX) <= 8) {
+                const snapOffset = screenCenterX - elementCenterX;
+                targetLeft = Math.round(targetLeft + snapOffset);
+                activeElement.style.left = `${targetLeft}px`;
+            }
+
+            const updatedRect = activeElement.getBoundingClientRect();
             this.updateGizmoPosition();
+            this.showGuides(updatedRect);
         },
 
         moveElement: function (deltaX, deltaY) {
             if (!activeElement) return;
             const computed = window.getComputedStyle(activeElement);
-            const currentML = parseInt(computed.marginLeft) || 0;
-            const currentMT = parseInt(computed.marginTop) || 0;
+            if (computed.position === 'static') {
+                activeElement.style.position = 'relative';
+            }
 
-            activeElement.style.marginLeft = `${currentML + deltaX}px`;
-            activeElement.style.marginTop = `${currentMT + deltaY}px`;
+            const currentLeft = parseFloat(activeElement.style.left) || 0;
+            const currentTop = parseFloat(activeElement.style.top) || 0;
 
+            activeElement.style.left = `${Math.round(currentLeft + deltaX)}px`;
+            activeElement.style.top = `${Math.round(currentTop + deltaY)}px`;
+
+            const updatedRect = activeElement.getBoundingClientRect();
             this.updateGizmoPosition();
+            this.showGuides(updatedRect);
+
+            clearTimeout(this._guideTimer);
+            this._guideTimer = setTimeout(() => this.hideGuides(), 1200);
         },
 
         quickScale: function (factor) {
@@ -1159,9 +1869,17 @@
             }
 
             const linkInput = document.getElementById('fvs-input-link');
+            const targetBlankInput = document.getElementById('fvs-input-target-blank');
             const parentLink = el.tagName === 'A' ? el : el.closest('a');
+            const buttonHref = el.getAttribute('data-fvs-href');
+            const currentHref = parentLink ? (parentLink.getAttribute('href') || parentLink.href || '') : (buttonHref || '');
+
             if (linkInput) {
-                linkInput.value = parentLink ? (parentLink.href || '') : '';
+                linkInput.value = currentHref;
+            }
+            if (targetBlankInput) {
+                const targetAttr = parentLink ? parentLink.getAttribute('target') : el.getAttribute('target');
+                targetBlankInput.checked = targetAttr === '_blank';
             }
         },
 
@@ -1209,11 +1927,28 @@
             }
         },
 
-        toggleInspector: function () {
+        toggleInspector: function (forceOpen) {
             const inspector = document.getElementById('falco-floating-inspector');
+            const btn = document.getElementById('fvs-btn-toggle-inspector');
             if (!inspector) return;
-            isInspectorCollapsed = !isInspectorCollapsed;
-            inspector.style.display = isInspectorCollapsed ? 'none' : 'flex';
+
+            const isCurrentlyHidden = inspector.style.display === 'none' || 
+                                      inspector.classList.contains('fvs-hidden') ||
+                                      getComputedStyle(inspector).display === 'none';
+
+            const shouldShow = forceOpen !== undefined ? forceOpen : isCurrentlyHidden;
+
+            if (shouldShow) {
+                inspector.style.display = 'flex';
+                inspector.classList.remove('fvs-hidden');
+                if (btn) btn.classList.add('active');
+                isInspectorCollapsed = false;
+            } else {
+                inspector.style.display = 'none';
+                inspector.classList.add('fvs-hidden');
+                if (btn) btn.classList.remove('active');
+                isInspectorCollapsed = true;
+            }
         },
 
         enableInlineEditing: function (enable) {
@@ -1296,8 +2031,53 @@
 
         setLink: function (href) {
             if (!activeElement) return;
+            this.recordState('alterar link');
             const parentLink = activeElement.tagName === 'A' ? activeElement : activeElement.closest('a');
-            if (parentLink) parentLink.href = href;
+            if (parentLink) {
+                parentLink.href = href;
+            } else if (activeElement.tagName === 'BUTTON') {
+                activeElement.setAttribute('data-fvs-href', href);
+                activeElement.onclick = (e) => {
+                    if (isEditMode) { e.preventDefault(); return; }
+                    if (href.startsWith('#')) {
+                        const targetEl = document.querySelector(href);
+                        if (targetEl) targetEl.scrollIntoView({ behavior: 'smooth' });
+                    } else {
+                        window.open(href, activeElement.getAttribute('target') || '_blank');
+                    }
+                };
+            }
+            this.saveEdits();
+        },
+
+        setQuickWhatsApp: function (phone, defaultMsg) {
+            const cleanPhone = phone.replace(/\D/g, '');
+            const encoded = encodeURIComponent(defaultMsg || 'Olá, gostaria de um atendimento jurídico.');
+            const waUrl = 'https://wa.me/55' + cleanPhone + '?text=' + encoded;
+            const input = document.getElementById('fvs-input-link');
+            if (input) input.value = waUrl;
+            this.setLink(waUrl);
+        },
+
+        setQuickAnchor: function (anchorId) {
+            const input = document.getElementById('fvs-input-link');
+            if (input) input.value = anchorId;
+            this.setLink(anchorId);
+        },
+
+        setLinkTarget: function (isNewTab) {
+            if (!activeElement) return;
+            this.recordState('alterar target do link');
+            const parentLink = activeElement.tagName === 'A' ? activeElement : activeElement.closest('a');
+            const targetVal = isNewTab ? '_blank' : '_self';
+            if (parentLink) {
+                parentLink.setAttribute('target', targetVal);
+                if (isNewTab) parentLink.setAttribute('rel', 'noopener noreferrer');
+                else parentLink.removeAttribute('rel');
+            } else if (activeElement.tagName === 'BUTTON') {
+                activeElement.setAttribute('target', targetVal);
+            }
+            this.saveEdits();
         },
 
         handleImageUpload: function (event) {
@@ -1345,81 +2125,316 @@
             activeElement.style.filter = filter;
         },
 
-        applyPreset: function (preset) {
+        applyEffect: function (effectName) {
             if (!activeElement) return;
-            switch (preset) {
-                case 'gold-solid':
-                    activeElement.style.background = 'linear-gradient(135deg, #c9a961 0%, #dfc079 50%, #967637 100%)';
-                    activeElement.style.color = '#060608';
-                    activeElement.style.fontWeight = '800';
-                    activeElement.style.border = 'none';
+            recordState();
+
+            switch (effectName) {
+                case 'float-3d':
+                    activeElement.classList.remove('fvs-no-3d');
+                    activeElement.removeAttribute('data-fvs-disable-3d');
+                    activeElement.classList.add('fvs-fx-float-3d');
+                    activeElement.classList.remove('fvs-fx-pulse');
+                    break;
+                case 'disable-3d': {
+                    // Desativa qualquer distorção 3D, perspectiva e animação de levitação
+                    const wrapper3d = activeElement.closest('.portrait-3d-wrapper, [class*="3d"], [class*="portrait"]') || activeElement;
+                    wrapper3d.classList.add('fvs-no-3d');
+                    wrapper3d.setAttribute('data-fvs-disable-3d', 'true');
+                    wrapper3d.style.animation = 'none';
+                    wrapper3d.style.transform = 'none';
+                    wrapper3d.style.perspective = 'none';
+
+                    activeElement.classList.add('fvs-no-3d');
+                    activeElement.setAttribute('data-fvs-disable-3d', 'true');
+                    activeElement.classList.remove('fvs-fx-float-3d');
+                    activeElement.style.animation = 'none';
+                    activeElement.style.transform = 'none';
+                    activeElement.style.perspective = 'none';
+
+                    const cardChild = wrapper3d.querySelector('.portrait-frame-card') || activeElement;
+                    if (cardChild) {
+                        cardChild.classList.add('fvs-no-3d');
+                        cardChild.setAttribute('data-fvs-disable-3d', 'true');
+                        cardChild.style.transform = 'none';
+                        cardChild.style.perspective = 'none';
+                    }
+                    showToast('Efeito 3D e distorção desativados com sucesso!', '🔲');
+                    break;
+                }
+                case 'pulse-heartbeat':
+                    activeElement.classList.add('fvs-fx-pulse');
+                    activeElement.classList.remove('fvs-fx-float-3d');
+                    break;
+                case 'shimmer':
+                    activeElement.classList.toggle('fvs-fx-shimmer');
+                    break;
+                case 'glow-gold':
+                    activeElement.classList.toggle('fvs-fx-glow-gold');
+                    break;
+                case 'uppercase-pro':
+                    activeElement.classList.toggle('fvs-fx-uppercase-pro');
+                    break;
+                case 'pill-shape':
                     activeElement.style.borderRadius = '9999px';
-                    activeElement.style.boxShadow = '0 6px 20px rgba(201, 169, 97, 0.45)';
+                    break;
+                case 'glass-gold':
+                    activeElement.classList.add('fvs-fx-glass-gold');
+                    activeElement.classList.remove('fvs-fx-glass-dark');
+                    break;
+                case 'glass-dark':
+                    activeElement.classList.add('fvs-fx-glass-dark');
+                    activeElement.classList.remove('fvs-fx-glass-gold');
+                    break;
+                case 'neon-border':
+                    activeElement.classList.toggle('fvs-fx-neon-border');
                     break;
                 case 'gold-outline':
                     activeElement.style.background = 'transparent';
                     activeElement.style.color = '#dfc079';
-                    activeElement.style.fontWeight = '700';
                     activeElement.style.border = '2px solid #c9a961';
-                    activeElement.style.borderRadius = '9999px';
-                    activeElement.style.boxShadow = '0 0 15px rgba(201, 169, 97, 0.2)';
+                    activeElement.style.boxShadow = '0 0 15px rgba(201, 169, 97, 0.25)';
                     break;
-                case 'whatsapp-pulse':
+                case 'whatsapp-glow':
                     activeElement.style.background = 'linear-gradient(135deg, #22c55e, #16a34a)';
                     activeElement.style.color = '#ffffff';
-                    activeElement.style.fontWeight = '800';
+                    activeElement.style.boxShadow = '0 8px 25px rgba(34, 197, 94, 0.6)';
                     activeElement.style.border = 'none';
-                    activeElement.style.borderRadius = '9999px';
-                    activeElement.style.boxShadow = '0 8px 25px rgba(34, 197, 94, 0.5)';
                     break;
-                case 'glass':
-                    activeElement.style.background = 'rgba(255, 255, 255, 0.06)';
-                    activeElement.style.backdropFilter = 'blur(16px)';
-                    activeElement.style.color = '#ffffff';
-                    activeElement.style.border = '1px solid rgba(201, 169, 97, 0.35)';
-                    activeElement.style.borderRadius = '16px';
-                    activeElement.style.boxShadow = '0 10px 30px rgba(0, 0, 0, 0.8)';
+                case 'remove-3d': {
+                    // LIMPEZA TOTAL DE EFEITOS
+                    activeElement.classList.remove(
+                        'fvs-fx-float-3d', 'fvs-fx-pulse', 'fvs-fx-shimmer', 
+                        'fvs-fx-glow-gold', 'fvs-fx-glass-gold', 'fvs-fx-glass-dark', 
+                        'fvs-fx-neon-border', 'fvs-fx-uppercase-pro'
+                    );
+                    activeElement.classList.add('fvs-no-3d');
+                    activeElement.setAttribute('data-fvs-disable-3d', 'true');
+
+                    activeElement.style.animation = 'none';
+                    activeElement.style.transform = 'none';
+                    activeElement.style.boxShadow = '';
+                    activeElement.style.filter = '';
+                    activeElement.style.perspective = 'none';
+                    activeElement.style.backdropFilter = '';
+
+                    const wrapper3d = activeElement.closest('.portrait-3d-wrapper, [class*="3d"], [class*="portrait"]');
+                    if (wrapper3d) {
+                        wrapper3d.classList.add('fvs-no-3d');
+                        wrapper3d.setAttribute('data-fvs-disable-3d', 'true');
+                        wrapper3d.style.animation = 'none';
+                        wrapper3d.style.transform = 'none';
+                        wrapper3d.style.perspective = 'none';
+                    }
+
+                    showToast('Todos os efeitos e distorções foram limpos!', '🧹');
                     break;
+                }
             }
+
+            this.updateGizmoPosition();
             this.syncInspectorValues(activeElement);
+        },
+
+        addStatusBeacon: function (type) {
+            if (!activeElement) return;
+
+            const existingBeacon = activeElement.querySelector('.fvs-status-beacon');
+            
+            if (type === 'remove') {
+                if (existingBeacon) existingBeacon.remove();
+                this.updateGizmoPosition();
+                return;
+            }
+
+            if (existingBeacon) {
+                existingBeacon.className = `fvs-status-beacon fvs-beacon-${type}`;
+            } else {
+                const beacon = document.createElement('span');
+                beacon.className = `fvs-status-beacon fvs-beacon-${type}`;
+                beacon.title = type === 'green' ? 'Online / Aberto' : (type === 'red' ? 'Urgente / Alerta' : 'Destaque VIP');
+                
+                if (activeElement.childNodes.length > 0) {
+                    activeElement.insertBefore(beacon, activeElement.firstChild);
+                } else {
+                    activeElement.appendChild(beacon);
+                }
+            }
+
             this.updateGizmoPosition();
         },
 
-        saveEdits: function () {
-            const appRoot = document.getElementById('root') || document.getElementById('page-wrapper') || document.body;
-            const clone = appRoot.cloneNode(true);
-            clone.querySelectorAll('#falco-top-studio-bar, #falco-editor-bar, #falco-floating-inspector, #falco-transform-gizmo, #falco-studio-launcher-btn, #falco-studio-styles, #falco-studio-fonts').forEach(el => el.remove());
-            clone.querySelectorAll('.fvs-selected-element').forEach(el => el.classList.remove('fvs-selected-element'));
-            clone.querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable'));
+        undo: function () {
+            if (undoStack.length === 0) return;
+            const previousSnapshot = undoStack.pop();
+            updateUndoButton();
 
-            localStorage.setItem(STORAGE_KEY, clone.innerHTML);
-            alert('✅ Alterações visuais salvas no navegador com sucesso!');
+            if (!Array.isArray(previousSnapshot)) return;
+
+            const currentElements = Array.from(document.body.children).filter(el => {
+                if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false;
+                if (el.id && el.id.startsWith('falco-')) return false;
+                return true;
+            });
+
+            previousSnapshot.forEach((item, idx) => {
+                let target = null;
+                if (item.id) target = document.getElementById(item.id);
+                if (!target && currentElements[idx] && currentElements[idx].tagName === item.tagName) {
+                    target = currentElements[idx];
+                }
+                if (target) {
+                    const temp = document.createElement('div');
+                    temp.innerHTML = item.outerHTML;
+                    const replacement = temp.firstElementChild;
+                    if (replacement) target.replaceWith(replacement);
+                }
+            });
+
+            activeElement = null;
+            this.updateGizmoPosition();
+            showToast('Ação desfeita com sucesso!', '↩️');
         },
 
-        loadSavedEdits: function () {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                const appRoot = document.getElementById('root') || document.getElementById('page-wrapper');
-                if (appRoot) {
-                    appRoot.innerHTML = saved;
-                    if (isEditMode) this.enableInlineEditing(true);
+        saveEdits: async function () {
+            const cleanHtml = this.getCleanHtml();
+            let savedToDisk = false;
+
+            // 1. Tenta salvar diretamente no arquivo no disco através do Dev Server local
+            try {
+                const targetFile = window.location.pathname.includes('formulario-completo') ? 'formulario-completo.html' : 'index.html';
+                const response = await fetch('/api/save-html', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        path: window.location.pathname,
+                        filename: targetFile,
+                        html: cleanHtml
+                    })
+                });
+
+                if (response.ok) {
+                    const resJson = await response.json();
+                    if (resJson && resJson.success) {
+                        savedToDisk = true;
+                    }
                 }
+            } catch (err) {
+                console.log('[Falco Studio] Servidor de disco offline, persistindo no armazenamento local do navegador...');
+            }
+
+            // 2. Salva snapshot no IndexedDB e LocalStorage para persistência instantânea no navegador
+            const pageElements = Array.from(document.body.children).filter(el => {
+                if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false;
+                if (el.id && el.id.startsWith('falco-')) return false;
+                return true;
+            });
+
+            const snapshot = pageElements.map(el => {
+                const clone = el.cloneNode(true);
+                clone.querySelectorAll('#falco-top-studio-bar, #falco-editor-bar, #falco-floating-inspector, #falco-transform-gizmo, #falco-alignment-overlay, #falco-studio-launcher-btn, #falco-studio-styles, #falco-studio-fonts, #falco-studio-toast').forEach(c => c.remove());
+                clone.querySelectorAll('.fvs-selected-element').forEach(c => c.classList.remove('fvs-selected-element'));
+                clone.querySelectorAll('[contenteditable]').forEach(c => c.removeAttribute('contenteditable'));
+                return {
+                    id: el.id || '',
+                    tagName: el.tagName,
+                    outerHTML: clone.outerHTML
+                };
+            });
+
+            await saveToDB(STORAGE_KEY, snapshot);
+
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+            } catch (e) {
+                // Quota excedida se houver imagens base64 muito grandes
+            }
+
+            if (savedToDisk) {
+                showToast('✅ Salvo no arquivo ' + (window.location.pathname.includes('formulario-completo') ? 'formulario-completo.html' : 'index.html') + ' no disco e no navegador!', '💾');
+            } else {
+                showToast('Alterações salvas no navegador! Para salvar permanentemente no arquivo, execute "npm run dev".', '💾');
             }
         },
 
-        resetOriginal: function () {
+        loadSavedEdits: async function () {
+            try {
+                // 1. Tenta carregar do IndexedDB
+                let snapshot = await loadFromDB(STORAGE_KEY);
+
+                // 2. Fallback para LocalStorage
+                if (!snapshot) {
+                    const raw = localStorage.getItem(STORAGE_KEY);
+                    if (raw) {
+                        try { snapshot = JSON.parse(raw); } catch (e) { snapshot = null; }
+                    }
+                }
+
+                if (!Array.isArray(snapshot) || snapshot.length === 0) return;
+
+                const currentElements = Array.from(document.body.children).filter(el => {
+                    if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false;
+                    if (el.id && el.id.startsWith('falco-')) return false;
+                    return true;
+                });
+
+                snapshot.forEach((item, idx) => {
+                    let target = null;
+                    if (item.id) target = document.getElementById(item.id);
+                    if (!target && currentElements[idx] && currentElements[idx].tagName === item.tagName) {
+                        target = currentElements[idx];
+                    }
+                    if (target) {
+                        const temp = document.createElement('div');
+                        temp.innerHTML = item.outerHTML;
+                        const replacement = temp.firstElementChild;
+                        if (replacement) target.replaceWith(replacement);
+                    }
+                });
+
+                if (isEditMode) {
+                    this.enableInlineEditing(true);
+                }
+                this.updateGizmoPosition();
+
+                console.log('✅ Falco Studio: Alterações anteriores restauradas com sucesso!');
+            } catch (err) {
+                console.warn('Erro ao restaurar edições salvas:', err);
+            }
+        },
+
+        resetOriginal: async function () {
             if (!confirm('Deseja descartar as alterações e restaurar a página original?')) return;
             localStorage.removeItem(STORAGE_KEY);
+            const db = await openDatabase();
+            if (db) {
+                try {
+                    const tx = db.transaction(STORE_NAME, 'readwrite');
+                    tx.objectStore(STORE_NAME).delete(STORAGE_KEY);
+                } catch(e) {}
+            }
             window.location.reload();
         },
 
         getCleanHtml: function () {
             const clone = document.documentElement.cloneNode(true);
-            clone.querySelectorAll('#falco-top-studio-bar, #falco-editor-bar, #falco-floating-inspector, #falco-transform-gizmo, #falco-studio-launcher-btn, #falco-studio-styles, #falco-studio-fonts').forEach(el => el.remove());
+            
+            // Remove Studio elements
+            clone.querySelectorAll('#falco-top-studio-bar, #falco-editor-bar, #falco-floating-inspector, #falco-transform-gizmo, #falco-alignment-overlay, #falco-studio-launcher-btn, #falco-studio-styles, #falco-studio-fonts, #falco-studio-toast, script[src="falco-visual-studio.js"]').forEach(el => el.remove());
+
+            // Remove Browser Extension elements & injections
+            clone.querySelectorAll('vmaker-container, grammarly-desktop-integration, reclameaqui-extension-pin, [id^="monica-"], [id^="speechify-"], .ch-sonic-improver, .chat-sonic-chromane-notification, [id^="azddb"], script[src^="chrome-extension://"], link[href^="chrome-extension://"]').forEach(el => el.remove());
 
             clone.classList.remove('falco-studio-active', 'fvs-dock-top', 'fvs-dock-bottom');
-            clone.querySelectorAll('.fvs-selected-element').forEach(el => el.classList.remove('fvs-selected-element'));
-            clone.querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable'));
+            
+            // Remove helper attributes and classes
+            clone.querySelectorAll('*').forEach(el => {
+                el.classList.remove('fvs-selected-element');
+                el.removeAttribute('contenteditable');
+                el.removeAttribute('bis_skin_checked');
+                el.removeAttribute('data-fvs-selected');
+                if (el.getAttribute('class') === '') el.removeAttribute('class');
+            });
 
             return '<!DOCTYPE html>\n' + clone.outerHTML;
         },
@@ -1454,3 +2469,14 @@
         window.FalcoStudio.init();
     }
 })();
+
+
+        document.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+                // Se não estiver dentro de um input/textarea normal
+                if (!['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+                    e.preventDefault();
+                    window.FalcoStudio.undo();
+                }
+            }
+        });

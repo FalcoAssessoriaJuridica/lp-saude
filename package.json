@@ -1,0 +1,14 @@
+{
+  "name": "lp-saude",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Landing Page Trabalhista — Defesa dos Direitos dos Profissionais da Saúde",
+  "scripts": {
+    "dev": "npx live-server --port=5173 --host=localhost --open=/",
+    "start": "npx live-server --port=5173 --host=localhost --open=/",
+    "serve": "npx serve ."
+  },
+  "devDependencies": {
+    "live-server": "^1.2.2"
+  }
+}
